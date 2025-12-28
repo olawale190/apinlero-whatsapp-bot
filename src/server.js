@@ -118,7 +118,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`
   🚀 Àpínlẹ̀rọ WhatsApp Bot running on port ${PORT}
 
