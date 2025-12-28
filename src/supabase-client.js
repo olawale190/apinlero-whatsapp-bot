@@ -9,10 +9,14 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://hxuzzhtjmpkhhmefajde.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+
+if (!SUPABASE_KEY) {
+  console.warn('⚠️ SUPABASE_SERVICE_KEY not set - database features will be limited');
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY || 'placeholder');
 
 /**
  * Get all active products
