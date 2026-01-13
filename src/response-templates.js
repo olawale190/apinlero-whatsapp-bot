@@ -60,21 +60,20 @@ Reply YES to confirm or let me know any changes.`,
 Order #: ${orderId.substring(0, 8).toUpperCase()}
 Total: £${total.toFixed(2)}
 
-Your order is being prepared and will be delivered within ${deliveryEstimate}.
+💳 *Pay Now:*
+https://project-apinlero.vercel.app/checkout?order=${orderId.substring(0, 8)}
 
-💳 Payment Methods:
-━━━━━━━━━━━━
-Bank Transfer:
+Or choose:
+• 💵 Cash on Delivery
+• 🏦 Bank Transfer:
   Isha's Treat Ltd
   Sort: 04-00-04
   Acc: 12345678
   Ref: ${orderId.substring(0, 8).toUpperCase()}
 
-💵 Cash on Delivery
-
-We'll notify you when it's on the way!
-Questions? Just reply to this message.`,
-    buttons: ['📍 Track Order', '💬 Contact Us']
+Delivery: ${deliveryEstimate}
+We'll notify you when it's on the way!`,
+    buttons: ['💳 Pay Now', '💵 Cash on Delivery']
   }),
 
   NEED_ADDRESS: ({ items, subtotal, notFound }) => {
@@ -318,19 +317,22 @@ Is there anything else I can help with?`,
   }),
 
   GENERAL_HELP: () => ({
-    text: `I'm here to help! 💬
+    text: `Thanks for your message! 😊
 
-I can assist you with:
-📦 Placing orders
-💰 Checking prices
-📋 Product availability
-🚚 Delivery information
-📍 Order tracking
+I'm the Àpínlẹ̀rọ ordering assistant. I can help you with:
 
-Just tell me what you need!
+📦 *Place an order* - "I want 2x Palm Oil"
+💰 *Check prices* - "How much is egusi?"
+📋 *See products* - "Products" or "What do you have?"
+🚚 *Delivery info* - "Delivery to SE1"
+📍 *Track order* - "Order status"
+
+For other questions, please contact us:
+📞 07448 682282
+📧 WhatsApp this number
 
 Or browse: apinlero.vercel.app`,
-    buttons: ['📦 Place Order', '📋 View Catalog', '🚚 Delivery Info']
+    buttons: ['📋 View Products', '📦 Place Order', '💬 Contact Us']
   }),
 
   ERROR: () => ({
@@ -355,6 +357,43 @@ Sunday: Closed
 For urgent orders, browse our website:
 apinlero.vercel.app`,
     buttons: ['📋 View Catalog']
+  }),
+
+  PAYMENT_CONFIRMED: ({ method, orderId }) => ({
+    text: `✅ Payment Method Confirmed!
+
+Order #: ${orderId}
+Payment: ${method}
+
+${method === 'Cash on Delivery'
+  ? `💵 Please have the exact amount ready when your order arrives.`
+  : method === 'Bank Transfer'
+    ? `🏦 Please transfer to:
+  Isha's Treat Ltd
+  Sort: 04-00-04
+  Acc: 12345678
+  Ref: ${orderId}
+
+Once transferred, we'll confirm receipt and dispatch your order.`
+    : `💳 You can pay securely at:
+https://project-apinlero.vercel.app/checkout?order=${orderId}`
+}
+
+We'll notify you when your order is ready for delivery.
+
+Thank you for your order! 🙏`,
+    buttons: ['📍 Track Order', '💬 Contact Us']
+  }),
+
+  NO_PRODUCTS: () => ({
+    text: `Sorry, we couldn't load our product catalog right now. 😔
+
+Please try again in a moment or browse our website:
+project-apinlero.vercel.app
+
+Or contact us directly:
+📞 07448 682282`,
+    buttons: ['🔄 Try Again', '💬 Contact Us']
   })
 };
 

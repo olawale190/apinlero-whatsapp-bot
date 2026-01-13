@@ -2,51 +2,85 @@
  * Àpínlẹ̀rọ Message Handler
  *
  * Processes incoming WhatsApp messages and generates responses
- * Manages conversation state and order flow
+ * Manages conversation state and order flow with Supabase persistence
  */
 
 import { parseMessage, matchProduct, getDeliveryZone } from './message-parser.js';
-import { getProducts, createOrder, getOrderByPhone } from './supabase-client.js';
+import {
+  getProducts,
+  createOrder,
+  getOrderByPhone,
+  updateOrderPayment,
+  getSession,
+  saveSession,
+  deleteSession,
+  getOrCreateCustomer,
+  logMessage
+} from './supabase-client.js';
 import { generateResponse } from './response-templates.js';
 
-// In-memory conversation state (use Redis in production)
-const conversations = new Map();
-
-// Conversation timeout (30 minutes)
-const CONVERSATION_TIMEOUT = 30 * 60 * 1000;
+// In-memory cache for sessions (backed by Supabase)
+const sessionCache = new Map();
 
 /**
  * Get or create conversation state for a customer
+ * Uses Supabase for persistence with in-memory cache
  */
-function getConversation(phone) {
-  const existing = conversations.get(phone);
+async function getConversation(phone, customerName = null) {
+  // Check cache first
+  let conversation = sessionCache.get(phone);
 
-  if (existing && Date.now() - existing.lastActivity < CONVERSATION_TIMEOUT) {
-    existing.lastActivity = Date.now();
-    return existing;
+  if (!conversation) {
+    // Try to load from Supabase
+    conversation = await getSession(phone);
   }
 
+  if (conversation) {
+    conversation.lastActivity = Date.now();
+    sessionCache.set(phone, conversation);
+    return conversation;
+  }
+
+  // Get or create customer record
+  const customer = await getOrCreateCustomer(phone, customerName);
+
   // Create new conversation
-  const conversation = {
+  conversation = {
     phone,
     state: 'INITIAL',
     pendingOrder: null,
     lastActivity: Date.now(),
-    context: {}
+    context: {},
+    customerId: customer?.id || null,
+    customerName: customer?.name || customerName
   };
 
-  conversations.set(phone, conversation);
+  sessionCache.set(phone, conversation);
+  await saveSession(phone, conversation);
+
   return conversation;
 }
 
 /**
  * Update conversation state
  */
-function updateConversation(phone, updates) {
-  const conversation = getConversation(phone);
+async function updateConversation(phone, updates) {
+  const conversation = sessionCache.get(phone) || { phone };
   Object.assign(conversation, updates, { lastActivity: Date.now() });
-  conversations.set(phone, conversation);
+  sessionCache.set(phone, conversation);
+
+  // Persist to Supabase
+  await saveSession(phone, conversation);
+
   return conversation;
+}
+
+/**
+ * Clear conversation state
+ */
+async function clearConversation(phone) {
+  sessionCache.delete(phone);
+  await deleteSession(phone);
 }
 
 /**
@@ -55,54 +89,99 @@ function updateConversation(phone, updates) {
  * @returns {Object} - Response {text, buttons}
  */
 export async function handleIncomingMessage({ from, customerName, text, messageId }) {
-  const conversation = getConversation(from);
+  const conversation = await getConversation(from, customerName);
   const parsed = parseMessage(text);
 
   console.log(`📝 Parsed message:`, {
     intent: parsed.intent,
     items: parsed.items.length,
-    state: conversation.state
+    state: conversation.state,
+    customer: conversation.customerName || customerName
   });
+
+  // Log inbound message
+  await logMessage(from, 'inbound', text, parsed.intent);
 
   // Handle based on intent and conversation state
   try {
+    let response;
+
     switch (parsed.intent) {
       case 'GREETING':
-        return handleGreeting(customerName, conversation);
+        response = handleGreeting(customerName, conversation);
+        break;
+
+      case 'PRODUCTS_LIST':
+        response = await handleProductsList();
+        break;
+
+      case 'START_ORDER':
+        response = await handleStartOrder(conversation);
+        break;
 
       case 'NEW_ORDER':
-        return await handleNewOrder(from, customerName, parsed, conversation);
+        response = await handleNewOrder(from, customerName, parsed, conversation);
+        break;
 
       case 'CONFIRM':
-        return await handleConfirmation(from, customerName, conversation);
+        response = await handleConfirmation(from, customerName, conversation);
+        break;
 
       case 'DECLINE':
-        return handleDecline(conversation);
+        response = handleDecline(conversation);
+        break;
 
       case 'PRICE_CHECK':
-        return await handlePriceCheck(text);
+        response = await handlePriceCheck(text);
+        break;
 
       case 'AVAILABILITY':
-        return await handleAvailability(text);
+        response = await handleAvailability(text);
+        break;
 
       case 'DELIVERY_INQUIRY':
-        return handleDeliveryInquiry(parsed);
+        response = handleDeliveryInquiry(parsed);
+        break;
 
       case 'BUSINESS_HOURS':
-        return handleBusinessHours(parsed.isBusinessHours);
+        response = handleBusinessHours(parsed.isBusinessHours);
+        break;
 
       case 'ORDER_STATUS':
-        return await handleOrderStatus(from);
+        response = await handleOrderStatus(from);
+        break;
 
       case 'CANCEL':
-        return handleCancel(conversation);
+        response = await handleCancel(conversation);
+        break;
 
       case 'THANKS':
-        return handleThanks(customerName);
+        response = handleThanks(customerName);
+        break;
+
+      case 'PAYMENT_CASH':
+        response = await handlePaymentChoice(from, conversation, 'cash');
+        break;
+
+      case 'PAYMENT_CARD':
+        response = await handlePaymentChoice(from, conversation, 'card');
+        break;
+
+      case 'PAYMENT_TRANSFER':
+        response = await handlePaymentChoice(from, conversation, 'bank_transfer');
+        break;
 
       default:
-        return handleGeneralInquiry(text, conversation);
+        response = await handleGeneralInquiry(text, conversation);
     }
+
+    // Log outbound message
+    if (response) {
+      await logMessage(from, 'outbound', response.text, parsed.intent, conversation.lastOrderId);
+    }
+
+    return response;
+
   } catch (error) {
     console.error('Message handling error:', error);
     return generateResponse('ERROR');
@@ -173,17 +252,18 @@ async function handleNewOrder(phone, customerName, parsed, conversation) {
     postcode,
     deliveryZone,
     customerName,
+    customerId: conversation.customerId,
     notFoundProducts: notFound
   };
 
-  updateConversation(phone, {
+  await updateConversation(phone, {
     state: 'AWAITING_CONFIRMATION',
     pendingOrder
   });
 
   // Check if we need address
   if (!address && !postcode) {
-    updateConversation(phone, { state: 'AWAITING_ADDRESS' });
+    await updateConversation(phone, { state: 'AWAITING_ADDRESS' });
     return generateResponse('NEED_ADDRESS', {
       items: orderItems,
       subtotal,
@@ -232,12 +312,13 @@ async function handleConfirmation(phone, customerName, conversation) {
       channel: 'WhatsApp',
       status: 'Pending',
       payment_method: 'pending',
-      notes: `Postcode: ${order.postcode || 'Not provided'}`
+      notes: `Postcode: ${order.postcode || 'Not provided'}`,
+      customer_id: conversation.customerId
     });
 
-    // Clear conversation state
-    updateConversation(phone, {
-      state: 'ORDER_CONFIRMED',
+    // Update conversation state
+    await updateConversation(phone, {
+      state: 'AWAITING_PAYMENT',
       pendingOrder: null,
       lastOrderId: createdOrder.id
     });
@@ -252,6 +333,40 @@ async function handleConfirmation(phone, customerName, conversation) {
   } catch (error) {
     console.error('Failed to create order:', error);
     return generateResponse('ORDER_FAILED');
+  }
+}
+
+/**
+ * Handle payment method selection
+ */
+async function handlePaymentChoice(phone, conversation, method) {
+  const orderId = conversation.lastOrderId;
+
+  if (!orderId) {
+    return generateResponse('NO_PENDING_ORDER');
+  }
+
+  try {
+    await updateOrderPayment(orderId, method, method === 'cash' ? 'pending' : 'awaiting');
+
+    await updateConversation(phone, {
+      state: 'ORDER_COMPLETED'
+    });
+
+    const methodLabels = {
+      'cash': 'Cash on Delivery',
+      'card': 'Card Payment',
+      'bank_transfer': 'Bank Transfer'
+    };
+
+    return generateResponse('PAYMENT_CONFIRMED', {
+      method: methodLabels[method],
+      orderId: orderId.substring(0, 8).toUpperCase()
+    });
+
+  } catch (error) {
+    console.error('Failed to update payment:', error);
+    return generateResponse('ERROR');
   }
 }
 
@@ -285,7 +400,7 @@ async function handlePriceCheck(text) {
         product: product.name,
         price: product.price,
         unit: product.unit,
-        inStock: product.stock_quantity > 0
+        inStock: product.is_active
       });
     }
   }
@@ -304,8 +419,8 @@ async function handleAvailability(text) {
         matchProduct(text) === product.name) {
       return generateResponse('AVAILABILITY_INFO', {
         product: product.name,
-        inStock: product.stock_quantity > 0,
-        quantity: product.stock_quantity
+        inStock: product.is_active,
+        quantity: 'Available'
       });
     }
   }
@@ -364,11 +479,8 @@ async function handleOrderStatus(phone) {
 /**
  * Handle cancellation request
  */
-function handleCancel(conversation) {
-  updateConversation(conversation.phone, {
-    state: 'INITIAL',
-    pendingOrder: null
-  });
+async function handleCancel(conversation) {
+  await clearConversation(conversation.phone);
   return generateResponse('CANCELLED');
 }
 
@@ -380,9 +492,68 @@ function handleThanks(customerName) {
 }
 
 /**
+ * Handle start order request (when user clicks "Place Order" button)
+ */
+async function handleStartOrder(conversation) {
+  // Show products with quick order option
+  const products = await getProducts();
+
+  if (!products || products.length === 0) {
+    return generateResponse('NO_PRODUCTS');
+  }
+
+  // Show top products for quick ordering
+  const topProducts = products.slice(0, 8);
+  let text = `📦 *Quick Order*\n\nPopular items:\n\n`;
+
+  topProducts.forEach((p, i) => {
+    text += `${i + 1}. ${p.name} - £${p.price.toFixed(2)}\n`;
+  });
+
+  text += `\n*To order:* Just type the number or name!\nExample: "1" or "Palm Oil" or "2x Egusi"\n\n💳 Pay online or Cash on Delivery`;
+
+  await updateConversation(conversation.phone, { state: 'AWAITING_ORDER' });
+
+  return { text, buttons: ['📋 Full Catalog', '❌ Cancel'] };
+}
+
+/**
+ * Handle products list request
+ */
+async function handleProductsList() {
+  const products = await getProducts();
+
+  if (!products || products.length === 0) {
+    return generateResponse('NO_PRODUCTS');
+  }
+
+  // Group by category
+  const categories = {};
+  for (const p of products) {
+    const cat = p.category || 'Other';
+    if (!categories[cat]) categories[cat] = [];
+    categories[cat].push(p);
+  }
+
+  let text = `📦 *Our Products*\n\n`;
+
+  for (const [category, items] of Object.entries(categories)) {
+    text += `*${category}*\n`;
+    for (const item of items) {
+      text += `• ${item.name} - £${item.price.toFixed(2)} (${item.unit})\n`;
+    }
+    text += '\n';
+  }
+
+  text += `\nTo order, send:\n"2x Palm Oil (5L), 3x Egusi Seeds"\n\nOr ask about a specific product!`;
+
+  return { text, buttons: ['📦 Place Order', '💬 Help'] };
+}
+
+/**
  * Handle general inquiries
  */
-function handleGeneralInquiry(text, conversation) {
+async function handleGeneralInquiry(text, conversation) {
   // If waiting for address, treat this as address input
   if (conversation.state === 'AWAITING_ADDRESS') {
     const parsed = parseMessage(text);
@@ -395,7 +566,7 @@ function handleGeneralInquiry(text, conversation) {
       order.deliveryFee = order.deliveryZone.fee;
       order.total = order.subtotal + order.deliveryFee;
 
-      updateConversation(conversation.phone, {
+      await updateConversation(conversation.phone, {
         state: 'AWAITING_CONFIRMATION',
         pendingOrder: order
       });
