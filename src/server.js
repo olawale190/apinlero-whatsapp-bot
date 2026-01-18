@@ -1,13 +1,14 @@
 /**
- * Àpínlẹ̀rọ WhatsApp Bot Server
+ * Àpínlẹ̀rọ WhatsApp Bot Server v2.1.0
  *
  * Webhook server for WhatsApp via Twilio
- * Handles incoming messages and processes orders
+ * Now with full message handler integration!
  */
 
-const express = require('express');
-const dotenv = require('dotenv');
-const { sendWhatsAppMessage, parseTwilioWebhook } = require('./twilio-service');
+import express from 'express';
+import dotenv from 'dotenv';
+import { sendWhatsAppMessage, parseTwilioWebhook } from './twilio-service.js';
+import { handleIncomingMessage } from './message-handler.js';
 
 dotenv.config();
 
@@ -15,7 +16,7 @@ const app = express();
 
 // Parse URL-encoded bodies (Twilio sends form data)
 app.use(express.urlencoded({ extended: false }));
-// Also support JSON for legacy/testing
+// Also support JSON for testing
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
@@ -25,13 +26,15 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ok',
     service: 'Àpínlẹ̀rọ WhatsApp Bot',
-    version: '2.0.0 (Twilio)',
+    version: '2.1.0 (Twilio + Message Handler)',
     provider: 'Twilio WhatsApp Sandbox',
     features: [
       'Twilio WhatsApp integration',
+      'Full message handler',
+      'Natural language order parsing',
+      'Product alias matching (Yoruba + English)',
       'Session persistence (Supabase)',
       'Customer tracking',
-      'Message logging',
       'Payment flow'
     ]
   });
@@ -47,18 +50,37 @@ app.post('/webhook/twilio', async (req, res) => {
 
     console.log(`📩 Message from ${incomingMessage.phoneNumber}: ${incomingMessage.body}`);
 
-    // TODO: Integrate with existing message-handler.js
-    // For now, send a simple acknowledgment
-    const responseText = `Thanks for your message! Àpínlẹ̀rọ is now powered by Twilio.\\n\\nYou said: "${incomingMessage.body}"\\n\\nFull bot integration coming soon!`;
+    // Process message through the full handler
+    const response = await handleIncomingMessage({
+      from: incomingMessage.phoneNumber,
+      customerName: incomingMessage.profileName || null,
+      text: incomingMessage.body,
+      messageId: incomingMessage.messageId
+    });
 
-    await sendWhatsAppMessage(incomingMessage.from, responseText);
-    console.log(`✅ Response sent to ${incomingMessage.phoneNumber}`);
+    // Send response via WhatsApp
+    if (response && response.text) {
+      await sendWhatsAppMessage(incomingMessage.from, response.text);
+      console.log(`✅ Response sent to ${incomingMessage.phoneNumber}`);
+    }
 
     // Respond to Twilio with 200 OK
     res.status(200).send('OK');
 
   } catch (error) {
     console.error('❌ Webhook error:', error);
+
+    // Send error message to user
+    try {
+      const incomingMessage = parseTwilioWebhook(req.body);
+      await sendWhatsAppMessage(
+        incomingMessage.from,
+        "Sorry, there was an error processing your message. Please try again or contact us directly."
+      );
+    } catch (e) {
+      // Ignore send errors
+    }
+
     res.status(500).send('Error processing message');
   }
 });
@@ -87,16 +109,17 @@ app.post('/webhook', (req, res) => {
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`
-🚀 Àpínlẹ̀rọ WhatsApp Bot v2.0.0 (Twilio) running on port ${PORT}
+🚀 Àpínlẹ̀rọ WhatsApp Bot v2.1.0 running on port ${PORT}
 
 Provider: Twilio WhatsApp Sandbox
-WhatsApp Number: ${process.env.TWILIO_WHATSAPP_NUMBER}
+WhatsApp Number: ${process.env.TWILIO_WHATSAPP_NUMBER || 'Not configured'}
 
 Features:
-✓ Twilio WhatsApp integration
+✓ Full message handler integration
+✓ Natural language order parsing
+✓ Product alias matching (Yoruba + English)
 ✓ Session persistence (Supabase)
 ✓ Customer tracking
-✓ Message logging
 ✓ Payment flow
 
 Endpoints:
@@ -105,8 +128,8 @@ Endpoints:
 - GET  /webhook        Legacy Meta verification
 - POST /webhook        Legacy Meta messages
 
-Webhook URL for Twilio: https://your-railway-url.up.railway.app/webhook/twilio
+Webhook URL for Twilio: https://your-deployment-url/webhook/twilio
   `);
 });
 
-module.exports = app;
+export default app;
