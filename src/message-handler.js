@@ -90,13 +90,14 @@ async function clearConversation(phone) {
  */
 export async function handleIncomingMessage({ from, customerName, text, messageId }) {
   const conversation = await getConversation(from, customerName);
-  const parsed = parseMessage(text);
+  const parsed = await parseMessage(text);
 
   console.log(`📝 Parsed message:`, {
     intent: parsed.intent,
     items: parsed.items.length,
     state: conversation.state,
-    customer: conversation.customerName || customerName
+    customer: conversation.customerName || customerName,
+    neo4j: parsed.neo4jEnabled ? '🧠 Active' : '⚠️ Fallback'
   });
 
   // Log inbound message
@@ -392,10 +393,24 @@ function handleDecline(conversation) {
 async function handlePriceCheck(text) {
   const products = await getProducts();
 
-  // Try to find the product mentioned
+  // Try Neo4j matching first
+  const matched = await matchProduct(text);
+  if (matched) {
+    const product = products.find(p => p.name.toLowerCase() === matched.name.toLowerCase());
+    if (product) {
+      console.log(`💰 Price check: "${text}" → ${matched.name} (${matched.language})`);
+      return generateResponse('PRICE_INFO', {
+        product: product.name,
+        price: product.price,
+        unit: product.unit,
+        inStock: product.is_active
+      });
+    }
+  }
+
+  // Fallback to simple name matching
   for (const product of products) {
-    if (text.toLowerCase().includes(product.name.toLowerCase()) ||
-        matchProduct(text) === product.name) {
+    if (text.toLowerCase().includes(product.name.toLowerCase())) {
       return generateResponse('PRICE_INFO', {
         product: product.name,
         price: product.price,
@@ -414,9 +429,23 @@ async function handlePriceCheck(text) {
 async function handleAvailability(text) {
   const products = await getProducts();
 
+  // Try Neo4j matching first
+  const matched = await matchProduct(text);
+  if (matched) {
+    const product = products.find(p => p.name.toLowerCase() === matched.name.toLowerCase());
+    if (product) {
+      console.log(`📦 Availability check: "${text}" → ${matched.name} (${matched.language})`);
+      return generateResponse('AVAILABILITY_INFO', {
+        product: product.name,
+        inStock: product.is_active,
+        quantity: 'Available'
+      });
+    }
+  }
+
+  // Fallback to simple name matching
   for (const product of products) {
-    if (text.toLowerCase().includes(product.name.toLowerCase()) ||
-        matchProduct(text) === product.name) {
+    if (text.toLowerCase().includes(product.name.toLowerCase())) {
       return generateResponse('AVAILABILITY_INFO', {
         product: product.name,
         inStock: product.is_active,
@@ -556,7 +585,7 @@ async function handleProductsList() {
 async function handleGeneralInquiry(text, conversation) {
   // If waiting for address, treat this as address input
   if (conversation.state === 'AWAITING_ADDRESS') {
-    const parsed = parseMessage(text);
+    const parsed = await parseMessage(text);
     if (parsed.address || parsed.postcode) {
       // Update pending order with address
       const order = conversation.pendingOrder;

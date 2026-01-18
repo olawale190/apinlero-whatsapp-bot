@@ -6,9 +6,13 @@
  * - Order items (product + quantity)
  * - Delivery address
  * - Customer preferences
+ *
+ * Now powered by Neo4j Knowledge Graph for Yoruba + English matching!
  */
 
-// Product catalog with aliases (Nigerian, Caribbean, and common names)
+import { matchProductFromGraph, isNeo4jAvailable } from './neo4j-matcher.js';
+
+// Fallback product catalog with aliases (used when Neo4j is unavailable)
 const PRODUCT_ALIASES = {
   'Palm Oil 5L': ['palm oil', 'red oil', 'zomi', 'epo pupa', 'adin'],
   'Jollof Rice Mix': ['jollof', 'jollof rice', 'jollof mix', 'party jollof'],
@@ -102,11 +106,11 @@ function hasOrderIndicators(text) {
 }
 
 /**
- * Parse order items from message
+ * Parse order items from message (async for Neo4j matching)
  * @param {string} message - The message text
- * @returns {Array} - Array of {product, quantity, unit, matched}
+ * @returns {Promise<Array>} - Array of {product, quantity, unit, matched, language, confidence}
  */
-export function parseOrderItems(message) {
+export async function parseOrderItems(message) {
   const items = [];
   const text = message.toLowerCase();
 
@@ -124,69 +128,104 @@ export function parseOrderItems(message) {
 
   // Extract with pattern 1
   let match;
+  const pattern1Matches = [];
   while ((match = pattern1.exec(text)) !== null) {
-    const quantity = parseInt(match[1]);
-    const productText = match[2].trim();
-    const matchedProduct = matchProduct(productText);
+    pattern1Matches.push({ quantity: parseInt(match[1]), productText: match[2].trim(), originalText: match[0] });
+  }
 
+  for (const m of pattern1Matches) {
+    const matchedProduct = await matchProduct(m.productText);
     if (matchedProduct) {
       items.push({
-        product: matchedProduct,
-        quantity,
+        product: matchedProduct.name,
+        quantity: m.quantity,
         unit: 'Each',
-        originalText: match[0]
+        originalText: m.originalText,
+        language: matchedProduct.language,
+        confidence: matchedProduct.confidence,
+        source: matchedProduct.source
       });
     }
   }
 
   // Extract with pattern 2
+  const pattern2Matches = [];
   while ((match = pattern2.exec(text)) !== null) {
-    const quantity = parseInt(match[1]);
-    const unit = normalizeUnit(match[2]);
-    const productText = match[3].trim();
-    const matchedProduct = matchProduct(productText);
+    pattern2Matches.push({
+      quantity: parseInt(match[1]),
+      unit: normalizeUnit(match[2]),
+      productText: match[3].trim(),
+      originalText: match[0]
+    });
+  }
 
+  for (const m of pattern2Matches) {
+    const matchedProduct = await matchProduct(m.productText);
     if (matchedProduct) {
       items.push({
-        product: matchedProduct,
-        quantity,
-        unit,
-        originalText: match[0]
+        product: matchedProduct.name,
+        quantity: m.quantity,
+        unit: m.unit,
+        originalText: m.originalText,
+        language: matchedProduct.language,
+        confidence: matchedProduct.confidence,
+        source: matchedProduct.source
       });
     }
   }
 
   // Extract with pattern 3 (only if we don't have items yet)
   if (items.length === 0) {
+    const pattern3Matches = [];
     while ((match = pattern3.exec(text)) !== null) {
-      const productText = match[1].trim();
-      const quantity = parseInt(match[2]);
-      const unit = match[3] ? normalizeUnit(match[3]) : 'Each';
-      const matchedProduct = matchProduct(productText);
+      pattern3Matches.push({
+        productText: match[1].trim(),
+        quantity: parseInt(match[2]),
+        unit: match[3] ? normalizeUnit(match[3]) : 'Each',
+        originalText: match[0]
+      });
+    }
 
-      if (matchedProduct && quantity > 0 && quantity < 100) {
-        items.push({
-          product: matchedProduct,
-          quantity,
-          unit,
-          originalText: match[0]
-        });
+    for (const m of pattern3Matches) {
+      if (m.quantity > 0 && m.quantity < 100) {
+        const matchedProduct = await matchProduct(m.productText);
+        if (matchedProduct) {
+          items.push({
+            product: matchedProduct.name,
+            quantity: m.quantity,
+            unit: m.unit,
+            originalText: m.originalText,
+            language: matchedProduct.language,
+            confidence: matchedProduct.confidence,
+            source: matchedProduct.source
+          });
+        }
       }
     }
   }
 
   // Pattern 4: If no items found, try to find product names and default to quantity 1
   if (items.length === 0) {
-    for (const [productName, aliases] of Object.entries(PRODUCT_ALIASES)) {
-      for (const alias of aliases) {
-        if (text.includes(alias.toLowerCase())) {
-          items.push({
-            product: productName,
-            quantity: 1,
-            unit: 'Each',
-            originalText: alias
-          });
-          break;
+    // Try matching each word/phrase in the message
+    const words = text.split(/\s+/);
+    for (let i = 0; i < words.length; i++) {
+      // Try single words and 2-3 word combinations
+      for (let len = 1; len <= Math.min(3, words.length - i); len++) {
+        const phrase = words.slice(i, i + len).join(' ');
+        if (phrase.length >= 3) {
+          const matchedProduct = await matchProduct(phrase);
+          if (matchedProduct && matchedProduct.confidence >= 0.8) {
+            items.push({
+              product: matchedProduct.name,
+              quantity: 1,
+              unit: 'Each',
+              originalText: phrase,
+              language: matchedProduct.language,
+              confidence: matchedProduct.confidence,
+              source: matchedProduct.source
+            });
+            break;
+          }
         }
       }
     }
@@ -207,24 +246,69 @@ export function parseOrderItems(message) {
 }
 
 /**
- * Match product text to catalog product
+ * Match product text to catalog product using Neo4j Knowledge Graph
+ * Falls back to local aliases if Neo4j is unavailable
+ *
  * @param {string} text - Product text from message
- * @returns {string|null} - Matched product name or null
+ * @returns {Promise<Object|null>} - Matched product info or null
  */
-export function matchProduct(text) {
+export async function matchProduct(text) {
   const normalizedText = text.toLowerCase().trim();
 
+  // Try Neo4j Knowledge Graph first (Yoruba + English aliases)
+  if (isNeo4jAvailable()) {
+    try {
+      const graphMatch = await matchProductFromGraph(normalizedText);
+      if (graphMatch) {
+        console.log(`🧠 Neo4j matched "${normalizedText}" → ${graphMatch.product} (${graphMatch.language}, ${graphMatch.confidence * 100}%)`);
+        return {
+          name: graphMatch.product,
+          price: graphMatch.price,
+          category: graphMatch.category,
+          alias: graphMatch.alias,
+          language: graphMatch.language,
+          confidence: graphMatch.confidence,
+          source: graphMatch.source
+        };
+      }
+    } catch (error) {
+      console.warn('Neo4j matching failed, using fallback:', error.message);
+    }
+  }
+
+  // Fallback to local matching
+  return matchProductLocal(normalizedText);
+}
+
+/**
+ * Local fallback product matching (when Neo4j is unavailable)
+ * @param {string} text - Normalized product text
+ * @returns {Object|null} - Matched product info or null
+ */
+function matchProductLocal(text) {
   // Direct match on product name
   for (const [productName, aliases] of Object.entries(PRODUCT_ALIASES)) {
-    if (productName.toLowerCase().includes(normalizedText) ||
-        normalizedText.includes(productName.toLowerCase())) {
-      return productName;
+    if (productName.toLowerCase().includes(text) ||
+        text.includes(productName.toLowerCase())) {
+      return {
+        name: productName,
+        alias: null,
+        language: 'english',
+        confidence: 0.9,
+        source: 'local_product'
+      };
     }
 
     // Check aliases
     for (const alias of aliases) {
-      if (normalizedText.includes(alias) || alias.includes(normalizedText)) {
-        return productName;
+      if (text.includes(alias) || alias.includes(text)) {
+        return {
+          name: productName,
+          alias: alias,
+          language: alias.match(/epo|adin|zomi|ogede|egwusi|agusi|okporoko|panla|ata|elubo|igba|ehuru|ariwo|iyan/) ? 'yoruba' : 'english',
+          confidence: 0.85,
+          source: 'local_alias'
+        };
       }
     }
   }
@@ -335,13 +419,13 @@ export function isBusinessHours() {
 }
 
 /**
- * Parse the full message and return structured data
+ * Parse the full message and return structured data (async for Neo4j)
  * @param {string} message - The message text
- * @returns {Object} - Parsed message data
+ * @returns {Promise<Object>} - Parsed message data
  */
-export function parseMessage(message) {
+export async function parseMessage(message) {
   const intent = detectIntent(message);
-  const items = parseOrderItems(message);
+  const items = await parseOrderItems(message);
   const { address, postcode } = parseAddress(message);
   const deliveryZone = getDeliveryZone(postcode);
 
@@ -352,6 +436,7 @@ export function parseMessage(message) {
     postcode,
     deliveryZone,
     isBusinessHours: isBusinessHours(),
-    originalMessage: message
+    originalMessage: message,
+    neo4jEnabled: isNeo4jAvailable()
   };
 }
